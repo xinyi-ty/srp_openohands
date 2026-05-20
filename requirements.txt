@@ -1,5 +1,13 @@
+# 基础依赖
 requests>=2.28.0
 urllib3>=1.26.0
 func-timeout>=4.3.5
 pandas>=1.3.0
 numpy>=1.21.0
+
+# OpenHands SDK 及工具
+openhands-sdk>=1.22.1
+openhands-tools>=1.22.1
+
+# 配置文件解析
+pyyaml>=6.0

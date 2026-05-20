@@ -1,0 +1,6 @@
+# 大语言模型配置文件 - 使用 DeepSeek
+llm:
+  provider: "deepseek"
+  model: "deepseek-chat"
+  api_key: "sk-212b8b835bb94e6c8b8d975ca389748a"   # 替换为您的真实 API Key
+  base_url: "https://api.deepseek.com/v1"
