@@ -30,25 +30,36 @@ def cleanup_source_files(target_dir: Path, source_extensions: list, target_exten
     """
     删除目标目录中所有源语言文件（如果存在对应的目标语言文件）。
     如果没有对应目标文件，则保留并记录警告。
+    返回一个列表，每个元素为 (源文件相对路径, 目标文件相对路径) 的元组。
     """
     deleted_count = 0
+    mappings = []  # 存储源->目标的映射关系
+
     for ext in source_extensions:
         for file_path in target_dir.rglob(f"*{ext}"):
             base_name = file_path.stem
             parent = file_path.parent
             found = False
+            target_file = None
             for t_ext in target_extensions:
                 candidate = parent / f"{base_name}{t_ext}"
                 if candidate.exists():
                     found = True
+                    target_file = candidate
                     break
             if found:
+                # 记录映射：源文件相对路径 -> 目标文件相对路径
+                src_rel = file_path.relative_to(target_dir)
+                tgt_rel = target_file.relative_to(target_dir)
+                mappings.append((str(src_rel), str(tgt_rel)))
+
                 file_path.unlink()
                 deleted_count += 1
                 logger.info(f"已删除源文件: {file_path}")
             else:
                 logger.warning(f"未找到对应的目标文件，保留源文件: {file_path}")
     logger.info(f"共删除 {deleted_count} 个源文件")
+    return mappings
 
 
 def run_translation(
@@ -98,7 +109,7 @@ def run_translation(
     # 6. 创建 Agent
     agent = Agent(llm=llm, tools=tools)
 
-    # 7. 强化后的任务指令（明确要求删除源文件）
+    # 7. 强化后的任务指令（明确要求删除源文件 + 错误处理要求）
     instruction = f"""You are an expert in code migration and translation.
 Your task is to translate the project '{project_name}' from {source_language} to {target_language}.
 
@@ -111,6 +122,16 @@ You have full access to read, edit, create, and delete files inside this directo
 2. **After successfully creating the translated file, you MUST delete the original source file.** Do not leave any {source_language} files in the directory.
 3. Do not mix {source_language} and {target_language} code in the same file. The translated file must contain only valid {target_language} code.
 4. Preserve the directory structure exactly as in the source project.
+
+**Error handling during compilation/testing (MANDATORY):**
+- When you run a compile or test command (e.g., `pytest`, `mvn compile`, `go build`), carefully examine the output.
+- If the command fails (non-zero exit code), you MUST:
+  1. **Output the exact error messages** in your thought process.
+  2. Analyze the root cause of the error.
+  3. Fix the relevant translated files (correct syntax, add missing imports, adjust types, etc.).
+  4. Re-run the failed command.
+- Repeat this cycle until the command succeeds.
+- Do not proceed to the next step until all compile/test errors are resolved.
 
 Only after completing these steps should you begin translating individual files.
 
@@ -136,8 +157,7 @@ You have a maximum of {max_iterations} steps.
     conversation.send_message(instruction)
     conversation.run()
 
-    # 9. 后处理：根据语言类型自动清理残留的源文件
-    # 定义源语言和目标语言的文件扩展名（可根据需要扩展）
+    # 9. 后处理：根据语言类型自动清理残留的源文件，并收集映射关系
     language_extensions = {
         "c++": (['.cpp', '.cxx', '.cc', '.c', '.h', '.hpp', '.hxx'], ['.py']),
         "python": (['.py'], ['.java', '.cpp']),
@@ -145,7 +165,6 @@ You have a maximum of {max_iterations} steps.
         "javascript": (['.js', '.jsx'], ['.py']),
     }
     src_key = source_language.lower()
-    # 直接获取扩展名元组，避免未使用变量的警告
     lang_entry = language_extensions.get(src_key)
     if lang_entry:
         source_extensions, target_extensions = lang_entry
@@ -153,17 +172,25 @@ You have a maximum of {max_iterations} steps.
         source_extensions = ['.c', '.cpp', '.h', '.py', '.java', '.js']
         target_extensions = ['.py'] if target_language.lower() == 'python' else ['.java']
 
-    cleanup_source_files(target_dir, source_extensions, target_extensions)
+    mappings = cleanup_source_files(target_dir, source_extensions, target_extensions)
 
-    # 10. 可选：生成映射文件 MAPPING.txt
+    # 10. 生成映射文件 MAPPING.txt（格式：源文件 -> 目标文件）
     mapping_file = target_dir / "MAPPING.txt"
     with open(mapping_file, 'w', encoding='utf-8') as f:
-        f.write(f"# Translation mapping for project {project_name}\n")
-        f.write(f"# Source: {source_language} -> Target: {target_language}\n\n")
-        for t_ext in target_extensions:
-            for target_file in target_dir.rglob(f"*{t_ext}"):
-                f.write(f"{target_file.relative_to(target_dir)}\n")
-        f.write("\nNote: Original source files have been deleted.\n")
+        f.write(f"# Translation mapping for project: {project_name}\n")
+        f.write(f"# Source language: {source_language} → Target language: {target_language}\n")
+        f.write("# Format: source_file -> target_file\n\n")
+        if mappings:
+            for src, tgt in mappings:
+                f.write(f"{src} -> {tgt}\n")
+        else:
+            # 如果没有记录到映射（例如所有源文件都未被删除），则尝试基于目标文件推断
+            f.write("# No source files were deleted (possible incomplete translation).\n")
+            for t_ext in target_extensions:
+                for target_file in target_dir.rglob(f"*{t_ext}"):
+                    # 猜测对应的源文件（仅作为占位）
+                    f.write(f"# (inferred) {target_file.stem}.* -> {target_file.relative_to(target_dir)}\n")
+        f.write("\nNote: Original source files have been deleted where corresponding target files exist.\n")
     logger.info(f"已生成映射文件: {mapping_file}")
 
     logger.info(f"翻译任务完成: {project_name} -> {target_dir}")
