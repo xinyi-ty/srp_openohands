@@ -2,5 +2,5 @@
 llm:
   provider: "deepseek"
   model: "deepseek-v4-flash"
-  api_key: "sk-891eab5d818a4b958b10fc5f5152a23a"   # 替换为您的真实 API Key
+  api_key: ""   # 替换为您的真实 API Key
   base_url: "https://api.deepseek.com/v1"
