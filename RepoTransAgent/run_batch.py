@@ -125,7 +125,7 @@ def main():
     parser.add_argument(
         "--model_name",
         default="deepseek-chat",
-        help="模型名称（DeepSeek）",
+        help="模型名称",
     )
     parser.add_argument(
         "--max_per_pair",
@@ -142,7 +142,7 @@ def main():
     parser.add_argument(
         "--max_iterations",
         type=int,
-        default=20,
+        default=50,   # 增大默认步数，避免漏译
         help="单个项目 Agent 的最大步数",
     )
 

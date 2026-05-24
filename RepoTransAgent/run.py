@@ -20,10 +20,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model_name",
         default="deepseek-chat",
-        help="LLM 模型名称（DeepSeek）",
+        help="LLM 模型名称",
     )
     parser.add_argument(
-        "--max_iterations", type=int, default=10, help="Agent 最大执行步数"
+        "--max_iterations", type=int, default=50, help="Agent 最大执行步数（增大以避免漏译）"
     )
     parser.add_argument(
         "--source_path",
