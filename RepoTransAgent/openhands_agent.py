@@ -33,7 +33,7 @@ def cleanup_source_files(target_dir: Path, source_extensions: list, target_exten
     返回一个列表，每个元素为 (源文件相对路径, 目标文件相对路径) 的元组。
     """
     deleted_count = 0
-    mappings = []  # 存储源->目标的映射关系
+    mappings = []
 
     for ext in source_extensions:
         for file_path in target_dir.rglob(f"*{ext}"):
@@ -48,7 +48,6 @@ def cleanup_source_files(target_dir: Path, source_extensions: list, target_exten
                     target_file = candidate
                     break
             if found:
-                # 记录映射：源文件相对路径 -> 目标文件相对路径
                 src_rel = file_path.relative_to(target_dir)
                 tgt_rel = target_file.relative_to(target_dir)
                 mappings.append((str(src_rel), str(tgt_rel)))
@@ -60,6 +59,27 @@ def cleanup_source_files(target_dir: Path, source_extensions: list, target_exten
                 logger.warning(f"未找到对应的目标文件，保留源文件: {file_path}")
     logger.info(f"共删除 {deleted_count} 个源文件")
     return mappings
+
+
+def check_missing_files(source_dir: Path, target_dir: Path, source_extensions: list, target_extensions: list):
+    """
+    检查原始源项目中有哪些文件没有被翻译。
+    返回缺失文件的相对路径列表。
+    """
+    missing = []
+    for ext in source_extensions:
+        for src_file in source_dir.rglob(f"*{ext}"):
+            rel_path = src_file.relative_to(source_dir)
+            base = src_file.stem
+            found = False
+            for t_ext in target_extensions:
+                tgt_file = target_dir / rel_path.with_suffix(t_ext)
+                if tgt_file.exists():
+                    found = True
+                    break
+            if not found:
+                missing.append(rel_path)
+    return missing
 
 
 def run_translation(
@@ -97,6 +117,8 @@ def run_translation(
         model=model_name,
         api_key=llm_config.get("api_key"),
         base_url=llm_config.get("base_url"),
+        provider="openai",   # 显式指定 OpenAI 兼容模式
+        extra_body={"thinking": {"type": "disabled"}},
     )
 
     # 5. 注册工具
@@ -109,7 +131,7 @@ def run_translation(
     # 6. 创建 Agent
     agent = Agent(llm=llm, tools=tools)
 
-    # 7. 强化后的任务指令（明确要求删除源文件 + 错误处理要求）
+    # 7. 优化后的任务指令（先翻译所有文件，再统一测试）
     instruction = f"""You are an expert in code migration and translation.
 Your task is to translate the project '{project_name}' from {source_language} to {target_language}.
 
@@ -123,33 +145,22 @@ You have full access to read, edit, create, and delete files inside this directo
 3. Do not mix {source_language} and {target_language} code in the same file. The translated file must contain only valid {target_language} code.
 4. Preserve the directory structure exactly as in the source project.
 
-**Error handling during compilation/testing (MANDATORY):**
-- When you run a compile or test command (e.g., `pytest`, `mvn compile`, `go build`), carefully examine the output.
-- If the command fails (non-zero exit code), you MUST:
-  1. **Output the exact error messages** in your thought process.
-  2. Analyze the root cause of the error.
-  3. Fix the relevant translated files (correct syntax, add missing imports, adjust types, etc.).
-  4. Re-run the failed command.
-- Repeat this cycle until the command succeeds.
-- Do not proceed to the next step until all compile/test errors are resolved.
-
-Only after completing these steps should you begin translating individual files.
-
-Workflow:
+**Workflow (follow strictly):**
 1. Analyze the project structure using `find`, `ls`, or `tree`.
-2. For each source file:
-   - Locate all relevant files written in {source_language}.
-   - Read its content.
-   - Translate it to {target_language}.
-   - Write the translation to a new file with the same relative path but with the appropriate extension (e.g., .py for Python, .java for Java, .cpp for C++).
-   - **Delete the original source file.**
-3. For configuration files (CMakeLists.txt, Makefile, pom.xml, package.json, etc.), either translate them appropriately or delete them if not needed.
-4. No extra modifications shall be made to files irrelevant to {source_language} and {target_language} languages.
-5. Run the test suite using the appropriate command (e.g., `pytest`, `npm test`, `mvn test`). If tests are missing, you may skip.
-6. If any test fails, analyze the error, fix the translated files, and re-run tests.
-7. The task is complete when all tests pass (or after a reasonable effort).
+2. **FIRST, translate ALL source files** (one by one) without stopping to run any compile or test commands.
+   - For each source file: read → translate → write target file → delete source file.
+   - Do NOT run any compile/test commands during this phase.
+3. After ALL files have been translated, **then** run the test suite once using the appropriate command (e.g., `pytest`, `npm test`, `mvn test`). If tests are missing, you may skip.
+4. If tests fail, analyze the errors and fix the relevant translated files.
+5. Re-run the tests after fixing. Repeat until all tests pass or you run out of steps.
+
+**Error handling during testing:**
+- If a test command fails, carefully read the error output.
+- Identify which file(s) caused the failure, fix them, and re-run the test command.
+- Do not go back to translating files that are already done unless fixing errors.
 
 You have a maximum of {max_iterations} steps.
+The task is complete when all tests pass (or after a reasonable effort if no tests exist).
 """
 
     # 8. 创建会话并运行
@@ -184,13 +195,30 @@ You have a maximum of {max_iterations} steps.
             for src, tgt in mappings:
                 f.write(f"{src} -> {tgt}\n")
         else:
-            # 如果没有记录到映射（例如所有源文件都未被删除），则尝试基于目标文件推断
             f.write("# No source files were deleted (possible incomplete translation).\n")
             for t_ext in target_extensions:
                 for target_file in target_dir.rglob(f"*{t_ext}"):
-                    # 猜测对应的源文件（仅作为占位）
                     f.write(f"# (inferred) {target_file.stem}.* -> {target_file.relative_to(target_dir)}\n")
         f.write("\nNote: Original source files have been deleted where corresponding target files exist.\n")
     logger.info(f"已生成映射文件: {mapping_file}")
+
+    # 11. 检查缺失的翻译文件（兜底检测）
+    missing = check_missing_files(source_dir, target_dir, source_extensions, target_extensions)
+    if missing:
+        logger.warning(f"发现 {len(missing)} 个未翻译的源文件，可能因步数不足导致漏译:")
+        for m in missing[:10]:   # 只显示前10个
+            logger.warning(f"  - {m}")
+        if len(missing) > 10:
+            logger.warning(f"  ... 以及 {len(missing)-10} 个更多文件")
+        # 保存完整列表到文件
+        missing_file = target_dir / "MISSING_FILES.txt"
+        with open(missing_file, 'w', encoding='utf-8') as f:
+            f.write(f"# 以下 {len(missing)} 个源文件在翻译后未能生成对应的目标文件\n")
+            f.write("# 可能原因：Agent 步数不足、翻译失败、或文件未被识别\n\n")
+            for m in missing:
+                f.write(f"{m}\n")
+        logger.info(f"未翻译文件列表已保存到 {missing_file}")
+    else:
+        logger.info("所有源文件均已翻译，无缺失。")
 
     logger.info(f"翻译任务完成: {project_name} -> {target_dir}")
