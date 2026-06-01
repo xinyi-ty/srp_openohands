@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""批量翻译脚本 —— 调用 run.py，源/目标目录分离，支持并行执行"""
+"""批量翻译脚本 —— 调用 lightweight_agent.run_translation 通过 subprocess 运行 run.py"""
 
 import json
 import os
@@ -12,9 +12,6 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 
 def read_projects_summary(file_path: str) -> list[dict]:
-    """读取 JSONL 格式的项目列表，每条记录需包含：
-       project_name, source_language, target_language, source_path, target_path
-    """
     projects = []
     with open(file_path, 'r', encoding='utf-8') as f:
         for line in f:
@@ -52,7 +49,6 @@ def run_single_translation(args: tuple) -> dict:
     source_path = project.get('source_path', '')
     target_path = project.get('target_path', '')
 
-    # 如果 JSONL 中未提供 target_path，则根据 base_dir 和项目名自动生成
     if not target_path:
         target_path = os.path.join(base_dir, "target_projects", project_name)
     if not source_path:
@@ -80,7 +76,7 @@ def run_single_translation(args: tuple) -> dict:
             cwd=base_dir,
             capture_output=True,
             text=True,
-            timeout=3600,  # 单个项目最长 1 小时
+            timeout=3600,
         )
         execution_time = time.time() - start_time
 
@@ -116,7 +112,7 @@ def run_single_translation(args: tuple) -> dict:
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="批量运行基于 OpenHands 的代码翻译（源/目标分离）")
+    parser = argparse.ArgumentParser(description="批量运行轻量级代码翻译（源/目标分离）")
     parser.add_argument(
         "--projects_file",
         default="projects_summary.jsonl",
@@ -124,8 +120,8 @@ def main():
     )
     parser.add_argument(
         "--model_name",
-        default="deepseek-chat",
-        help="模型名称",
+        default="deepseek-v4-flash",
+        help="模型名称（传递给 run.py）",
     )
     parser.add_argument(
         "--max_per_pair",
@@ -136,13 +132,13 @@ def main():
     parser.add_argument(
         "--num_processes",
         type=int,
-        default=4,   # 根据机器性能调整，避免 API 限流
+        default=4,
         help="并行进程数",
     )
     parser.add_argument(
         "--max_iterations",
         type=int,
-        default=50,   # 增大默认步数，避免漏译
+        default=50,
         help="单个项目 Agent 的最大步数",
     )
 

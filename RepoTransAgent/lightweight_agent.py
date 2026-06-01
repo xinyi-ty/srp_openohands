@@ -1,309 +1,489 @@
-import json
+"""
+RepoTransBench 轻量级 ReAct 翻译 Agent
+基于原始 RepoTransBench 的简化实现，使用直接 LLM API 调用替代 OpenHands。
+"""
+import ast
 import logging
 import os
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Optional, Tuple
 
 import requests
-import yaml
 
 logger = logging.getLogger(__name__)
 
+# ── 自动加载 .env ──────────────────────────────────────────────
+try:
+    from dotenv import load_dotenv
+    env_path = Path(__file__).resolve().parent.parent / ".env"
+    if env_path.exists():
+        load_dotenv(dotenv_path=env_path, verbose=False)
+        logger.info(f"已加载环境变量文件: {env_path}")
+except ImportError:
+    pass
 
-# ---------- 配置加载 ----------
-def load_llm_config(config_path: str = None) -> dict:
-    if config_path is None:
-        config_path = Path(__file__).parent / "llm_config.yaml"
-    with open(config_path, "r", encoding='utf-8') as f:
-        config = yaml.safe_load(f)
-    llm_config = config.get("llm", {})
+
+# ── LLM 配置 ────────────────────────────────────────────────────
+def load_llm_config() -> dict:
     return {
-        "model": llm_config.get("model"),
-        "api_key": llm_config.get("api_key"),
-        "base_url": llm_config.get("base_url"),
+        "api_key": os.getenv("DEEPSEEK_API_KEY", ""),
+        "base_url": os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
+        "model": os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash"),
     }
 
 
-# ---------- LLM 调用 ----------
+# ── LLM 调用（含自动重试） ─────────────────────────────────────
 def call_llm(messages: List[dict], config: dict, temperature: float = 0.2) -> str:
-    """调用 DeepSeek API（OpenAI 兼容格式）"""
     url = f"{config['base_url']}/chat/completions"
     headers = {
         "Authorization": f"Bearer {config['api_key']}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
     }
     payload = {
         "model": config["model"],
         "messages": messages,
         "temperature": temperature,
-        "extra_body": {"thinking": {"type": "disabled"}}
+        "extra_body": {"thinking": {"type": "disabled"}},
     }
-    try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=120)
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
-    except Exception as e:
-        logger.error(f"LLM 调用失败: {e}")
-        raise
+    for attempt in range(3):
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=120)
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"] or ""
+        except requests.exceptions.Timeout:
+            logger.warning(f"LLM 超时 (attempt {attempt+1}/3)")
+        except requests.exceptions.HTTPError as e:
+            s = e.response.status_code
+            if s in (429, 502, 503, 504) and attempt < 2:
+                logger.warning(f"LLM 返回 {s}，重试 ({attempt+1}/3)")
+            else:
+                raise
+        except Exception as e:
+            logger.error(f"LLM 调用失败 (attempt {attempt+1}/3): {e}")
+            if attempt >= 2:
+                raise
+        time.sleep(2 ** attempt)
+    raise RuntimeError("LLM 调用在 3 次重试后仍然失败")
 
 
-# ---------- 工具函数（动作执行）----------
+# ── 动作执行 ────────────────────────────────────────────────────
 def execute_action(action_name: str, **kwargs) -> str:
-    """执行单个动作，返回观察结果（字符串）"""
     try:
         if action_name == "ReadFile":
-            path = kwargs["path"]
-            with open(path, 'r', encoding='utf-8') as f:
-                return f.read()
+            path = kwargs.get("path", "")
+            if not path or not os.path.exists(path):
+                return f"File not found: {path}"
+            max_size = 200 * 1024
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read(max_size + 1)
+                if len(content) > max_size:
+                    return f"Warning: file >200KB, showing first {max_size} bytes:\n{content[:max_size]}\n... (truncated)"
+                return content
+
         elif action_name == "CreateFile":
-            path = kwargs["path"]
+            path = kwargs.get("path", "")
+            if not path:
+                return "Error: CreateFile called without a valid 'path' argument"
             content = kwargs.get("content", "")
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, 'w', encoding='utf-8') as f:
+            dirpath = os.path.dirname(path)
+            if dirpath:
+                os.makedirs(dirpath, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
                 f.write(content)
             return f"File created: {path}"
+
         elif action_name == "DeleteFile":
-            path = kwargs["path"]
+            path = kwargs.get("path", "")
+            if not path:
+                return "Error: DeleteFile called without a valid 'path' argument"
             if os.path.exists(path):
                 os.remove(path)
                 return f"File deleted: {path}"
-            else:
-                return f"File not found: {path}"
+            return f"File not found: {path}"
+
         elif action_name == "ExecuteCommand":
-            cmd = kwargs["command"]
+            cmd = kwargs.get("command", "")
             cwd = kwargs.get("cwd", ".")
-            result = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True, timeout=60)
-            output = result.stdout + result.stderr
+            result = subprocess.run(
+                cmd, shell=True, cwd=cwd, capture_output=True, text=True, timeout=120
+            )
+            output = (result.stdout + result.stderr)[:5000]
             if result.returncode != 0:
-                return f"Command failed (exit {result.returncode}):\n{output[:1000]}"
-            return output[:2000]  # 限制长度
+                if len(output) > 3000:
+                    output = output[-3000:]
+                return f"Command failed (exit {result.returncode}):\n{output}"
+            if len(output) > 4000:
+                output = output[:4000] + "\n... (truncated)"
+            return output
+
+        elif action_name == "SearchContent":
+            keyword = kwargs.get("keyword", "")
+            matches = []
+            for root, _dirs, files in os.walk("."):
+                for fname in files:
+                    if not fname.endswith((".py", ".java", ".txt", ".json", ".xml", ".yml", ".yaml", ".sh", ".md")):
+                        continue
+                    fpath = os.path.join(root, fname)
+                    try:
+                        with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                            if keyword.lower() in f.read().lower():
+                                matches.append(os.path.relpath(fpath))
+                                if len(matches) >= 10:
+                                    break
+                    except Exception:
+                        pass
+                if len(matches) >= 10:
+                    break
+            return (
+                f"Found '{keyword}' in: {', '.join(matches)}" if matches
+                else f"No matches found for '{keyword}'"
+            )
+
         elif action_name == "Finished":
             return "TASK_FINISHED"
-        else:
-            return f"Unknown action: {action_name}"
+
+        return f"Unknown action: {action_name}"
+
     except Exception as e:
-        return f"Error executing {action_name}: {str(e)}"
+        return f"Error executing {action_name}: {e}"
 
 
-def parse_action(response: str) -> Tuple[str, Dict[str, Any]]:
+# ── Action 解析 ────────────────────────────────────────────────
+def _strip_quotes(text: str) -> str:
+    text = text.strip()
+    for q in ('"', "'", "`"):
+        if text.startswith(q) and text.endswith(q):
+            text = text[1:-1]
+            break
+    return text.strip()
+
+
+def parse_action(text: str) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
     """
-    从 LLM 响应中解析 Action: 行。
-    格式示例：
-        Action: ReadFile(path="src/main.py")
-    返回 (action_name, kwargs_dict)
+    解析 LLM 输出中的 Action。返回 (action_name, kwargs) 或 (None, None)。
+    支持的格式（按优先级）:
+      1. CreateFile(path="x"):  ```lang\ncontent\n```       ← 代码块格式（推荐）
+      2. Action: Xxx(key="value", ...)                     ← 行内格式（兼容）
     """
-    pattern = r'Action:\s*(\w+)\((.*)\)'
-    match = re.search(pattern, response, re.DOTALL)
-    if not match:
+    if not text or not text.strip():
         return None, None
-    action_name = match.group(1)
-    params_str = match.group(2).strip()
-    # 简单解析 kwargs，支持字符串、数字等（eval 安全风险，但仅用于可信环境）
-    # 注意：生产环境建议用 ast.literal_eval 或正则解析
-    kwargs = {}
-    if params_str:
-        # 简单处理 key=value 对，value 可能带引号
-        # 这里用正则匹配 key="value" 或 key=数字
-        for kv in re.findall(r'(\w+)=(".*?"|\d+)', params_str):
-            key, val = kv
-            if val.startswith('"') and val.endswith('"'):
-                val = val[1:-1]
-            elif val.isdigit():
-                val = int(val)
-            kwargs[key] = val
-    return action_name, kwargs
+
+    # ── 1. CreateFile 代码块格式 ──
+    m = re.search(
+        r'CreateFile\(path=(.*?)\):\s*```[^\n]*\n(.*?)\n```',
+        text, re.DOTALL
+    )
+    if m:
+        return "CreateFile", {
+            "path": _strip_quotes(m.group(1)),
+            "content": m.group(2),
+        }
+
+    # ── 2. 行内 Action: Xxx(...) ──
+    action_match = re.search(r'(?:^|\n)Action:\s*(\w+)\(', text)
+    if not action_match:
+        return None, None
+
+    action_name = action_match.group(1)
+    err_kwargs: Dict[str, Any] = {}
+
+    if action_name == "Finished":
+        return "Finished", {}
+
+    if action_name in ("ReadFile", "DeleteFile"):
+        m = re.search(rf"{action_name}\(path=(.*?)\)", text)
+        if m:
+            return action_name, {"path": _strip_quotes(m.group(1))}
+        return action_name, err_kwargs
+
+    if action_name == "ExecuteCommand":
+        m = re.search(r"ExecuteCommand\(command=(.*?)\)", text)
+        if m:
+            return action_name, {"command": _strip_quotes(m.group(1))}
+        return action_name, err_kwargs
+
+    if action_name == "SearchContent":
+        m = re.search(r"SearchContent\(keyword=(.*?)\)", text)
+        if m:
+            return action_name, {"keyword": _strip_quotes(m.group(1))}
+        return action_name, err_kwargs
+
+    # ── 3. CreateFile 行内兼容 ──
+    if action_name == "CreateFile":
+        # 先尝试完整 code-block
+        m = re.search(r'CreateFile\(path=(.*?)\):\s*```[^\n]*\n(.*?)\n```', text, re.DOTALL)
+        if m:
+            return "CreateFile", {"path": _strip_quotes(m.group(1)), "content": m.group(2)}
+
+        # 再尝试行内格式
+        m = re.search(r'CreateFile\(path=(.*?),\s*content=(.*)', text, re.DOTALL)
+        if m:
+            raw_path = _strip_quotes(m.group(1))
+            raw_content = m.group(2).strip()
+            if raw_content.endswith(")"):
+                raw_content = raw_content[:-1]
+            try:
+                content_val = ast.literal_eval(raw_content)
+            except Exception:
+                content_val = _strip_quotes(raw_content)
+            if raw_path:
+                return "CreateFile", {"path": raw_path, "content": content_val}
+
+        # 降级：只提取 path（LLM 有时只写 header 不写内容）
+        m = re.search(r'CreateFile\(path=(.*?)\)', text)
+        if m:
+            raw_path = _strip_quotes(m.group(1))
+            if raw_path:
+                return "CreateFile", {"path": raw_path, "content": ""}
+
+    return None, None
 
 
-# ---------- ReAct 循环 ----------
+# ── ReAct 循环 ─────────────────────────────────────────────────
 def run_react_loop(instruction: str, workspace_dir: str, max_steps: int = 50) -> None:
-    """执行 ReAct 循环，直到 Finished 或达到最大步数"""
     llm_config = load_llm_config()
-    messages = [
-        {"role": "system",
-         "content": "You are an AI assistant that helps translate code repositories. You can use the following actions: ReadFile, CreateFile, DeleteFile, ExecuteCommand, Finished. Respond with a Thought: and then Action: line. Example:\nThought: I need to list files.\nAction: ExecuteCommand(command=\"ls -la\")"},
-        {"role": "user", "content": instruction}
+    if not llm_config.get("api_key"):
+        raise RuntimeError("请在 .env 中设置 DEEPSEEK_API_KEY")
+
+    original_cwd = os.getcwd()
+    os.chdir(workspace_dir)
+    logger.info(f"工作目录: {workspace_dir}")
+
+    system_prompt = (
+        "You translate code between programming languages. Available actions:\n\n"
+        "1. CreateFile(path=\"file.java\"):\n"
+        "   ```java\n"
+        "   public class File {\n"
+        "       // translated code\n"
+        "   }\n"
+        "   ```\n"
+        "2. ReadFile(path=\"file.py\")\n"
+        "3. DeleteFile(path=\"file.py\")\n"
+        "4. ExecuteCommand(command=\"shell command\")\n"
+        "5. SearchContent(keyword=\"search term\")\n"
+        "6. Finished()\n\n"
+        "Rules:\n"
+        "- Always start with 'Thought:' then 'Action:'.\n"
+        "- For CreateFile, put content in a code block AFTER '):', NOT in the parentheses.\n"
+        "- Read a file first, then CreateFile with translated content, then DeleteFile.\n"
+        "- Do NOT run test commands. Only translate.\n"
+    )
+
+    messages: List[dict] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": instruction},
     ]
-    step = 0
-    while step < max_steps:
-        step += 1
-        logger.info(f"Step {step}/{max_steps}")
-        response = call_llm(messages, llm_config)
-        logger.debug(f"LLM response: {response[:500]}")
-        messages.append({"role": "assistant", "content": response})
 
-        action_name, kwargs = parse_action(response)
-        if action_name is None:
-            logger.warning("No valid action found, assuming finished.")
-            break
-        if action_name == "Finished":
-            logger.info("Agent finished task.")
-            break
+    try:
+        for step in range(1, max_steps + 1):
+            logger.info(f"Step {step}/{max_steps}")
 
-        observation = execute_action(action_name, **kwargs)
-        logger.info(f"Action: {action_name} -> {observation[:200]}")
-        messages.append({"role": "user", "content": f"Observation: {observation}"})
+            response = call_llm(messages, llm_config)
+            if not response or not response.strip():
+                logger.warning("LLM returned empty, retrying once...")
+                response = call_llm(messages, llm_config)
+            if not response or not response.strip():
+                logger.warning("LLM returned empty twice, aborting loop.")
+                break
 
-    if step >= max_steps:
-        logger.warning(f"Reached max steps ({max_steps}) without finishing.")
+            messages.append({"role": "assistant", "content": response})
+
+            action_name, kwargs = parse_action(response)
+            if action_name is None:
+                logger.info(f"Action: none (response: {response[:200]})")
+                messages.append({
+                    "role": "user",
+                    "content": 'Use format: Thought: ...  Action: CreateFile(path="x.java"):  ```java  ...  ```',
+                })
+                continue
+
+            if action_name == "Finished":
+                logger.info("Agent finished task.")
+                break
+
+            observation = execute_action(action_name, **kwargs)
+            short_obs = observation[:200].replace("\n", " ")
+            logger.info(f"Action: {action_name} -> {short_obs}")
+            messages.append({"role": "user", "content": f"Observation: {observation}"})
+
+            # 窗口滑动：保留 system + instruction + 最近 2 轮
+            while len(messages) > 6:
+                messages[2:4] = []
+
+        else:
+            logger.warning(f"Reached max steps ({max_steps}) without finishing.")
+
+    finally:
+        os.chdir(original_cwd)
 
 
-# ---------- 后处理函数（从原 openhands_agent 复用）----------
-def cleanup_source_files(target_dir: Path, source_extensions: list, target_extensions: list) -> list:
-    """删除源文件并返回映射"""
-    deleted_count = 0
-    mappings = []
+# ── 后处理 ─────────────────────────────────────────────────────
+def cleanup_source_files(
+    target_dir: Path, source_extensions: list, target_extensions: list
+) -> list:
+    """删除已翻译的源文件，返回 (源文件, 目标文件) 映射列表"""
+    deleted, mappings = 0, []
     for ext in source_extensions:
         for file_path in target_dir.rglob(f"*{ext}"):
-            base_name = file_path.stem
-            parent = file_path.parent
-            found = False
-            target_file = None
+            base, parent = file_path.stem, file_path.parent
             for t_ext in target_extensions:
-                candidate = parent / f"{base_name}{t_ext}"
+                candidate = parent / f"{base}{t_ext}"
                 if candidate.exists():
-                    found = True
-                    target_file = candidate
+                    mappings.append((
+                        str(file_path.relative_to(target_dir)),
+                        str(candidate.relative_to(target_dir)),
+                    ))
+                    file_path.unlink()
+                    deleted += 1
+                    logger.info(f"已删除源文件: {file_path}")
                     break
-            if found:
-                src_rel = file_path.relative_to(target_dir)
-                tgt_rel = target_file.relative_to(target_dir)
-                mappings.append((str(src_rel), str(tgt_rel)))
-                file_path.unlink()
-                deleted_count += 1
-                logger.info(f"已删除源文件: {file_path}")
-            else:
-                logger.warning(f"未找到对应的目标文件，保留源文件: {file_path}")
-    logger.info(f"共删除 {deleted_count} 个源文件")
+    logger.info(f"共删除 {deleted} 个源文件")
     return mappings
 
 
-def check_missing_files(source_dir: Path, target_dir: Path, source_extensions: list, target_extensions: list) -> list:
+def check_missing_files(
+    source_dir: Path, target_dir: Path, source_extensions: list, target_extensions: list
+) -> list:
+    """返回尚未翻译的源文件列表"""
     missing = []
     for ext in source_extensions:
         for src_file in source_dir.rglob(f"*{ext}"):
-            rel_path = src_file.relative_to(source_dir)
-            found = False
-            for t_ext in target_extensions:
-                tgt_file = target_dir / rel_path.with_suffix(t_ext)
-                if tgt_file.exists():
-                    found = True
-                    break
+            rel = src_file.relative_to(source_dir)
+            found = any(
+                (target_dir / rel.with_suffix(t_ext)).exists()
+                for t_ext in target_extensions
+            )
             if not found:
-                missing.append(rel_path)
+                missing.append(rel)
     return missing
 
 
-# ---------- 主翻译函数（替代原 run_translation）----------
+# ── 主翻译入口 ────────────────────────────────────────────────
 def run_translation(
-        project_name: str,
-        source_language: str,
-        target_language: str,
-        model_name: str,  # 保留参数，但实际从 config 读取，可忽略
-        max_iterations: int,
-        source_path: str,
-        target_path: str,
+    project_name: str,
+    source_language: str,
+    target_language: str,
+    model_name: str = "",
+    max_iterations: int = 50,
+    source_path: str = "",
+    target_path: str = "",
 ) -> None:
-    """使用轻量级 ReAct Agent 执行翻译"""
-    # 1. 准备目标目录
-    target_dir = Path(target_path)
-    if target_dir.exists():
-        logger.info(f"清空已存在的目标目录: {target_dir}")
-        shutil.rmtree(target_dir)
-    target_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"开始翻译: {source_language} → {target_language} | 项目: {project_name}")
+    logger.info(f"源路径: {source_path} | 目标路径: {target_path}")
 
-    # 2. 复制源项目
-    source_dir = Path(source_path)
-    if not source_dir.exists():
-        raise FileNotFoundError(f"源项目目录不存在: {source_dir}")
-    logger.info(f"复制源项目 {source_dir} -> {target_dir}")
-    shutil.copytree(source_dir, target_dir, dirs_exist_ok=True)
-
-    # 3. 构建指令（复用原 openhands_agent 中的 instruction）
-    instruction = f"""You are an expert in code migration and translation.
-Your task is to translate the project '{project_name}' from {source_language} to {target_language}.
-
-The source code has been copied to the current working directory: {target_dir}
-You have full access to read, edit, create, and delete files inside this directory.
-
-**Critical rules for file management:**
-1. For every source code file (extension specific to {source_language}), you MUST create a corresponding translated file with the **same base name** but the appropriate extension for {target_language}.
-   Example: `src/main.cpp` (C++) → `src/main.py` (Python)
-2. **After successfully creating the translated file, you MUST delete the original source file.** Do not leave any {source_language} files in the directory.
-3. Do not mix {source_language} and {target_language} code in the same file. The translated file must contain only valid {target_language} code.
-4. Preserve the directory structure exactly as in the source project.
-
-**Workflow (follow strictly):**
-1. Analyze the project structure using `ExecuteCommand(command="find . -type f")` or `ls -la`.
-2. **FIRST, translate ALL source files** (one by one) without stopping to run any compile or test commands.
-   - For each source file: use ReadFile to read content → CreateFile to write target file → DeleteFile to remove source file.
-   - Do NOT run any compile/test commands during this phase.
-3. After ALL files have been translated, **then** run the test suite once using `ExecuteCommand` (e.g., `pytest`, `npm test`, `mvn test`). If tests are missing, you may skip.
-4. If tests fail, analyze the errors and fix the relevant translated files (ReadFile, CreateFile again).
-5. Re-run the tests after fixing. Repeat until all tests pass or you run out of steps.
-
-**Error handling during testing:**
-- If a test command fails, carefully read the error output.
-- Identify which file(s) caused the failure, fix them, and re-run the test command.
-- Do not go back to translating files that are already done unless fixing errors.
-
-You have a maximum of {max_iterations} steps.
-When you are finished, output `Action: Finished()`.
-"""
-
-    # 4. 运行 ReAct 循环
-    run_react_loop(instruction, str(target_dir), max_iterations)
-
-    # 5. 后处理：根据语言类型清理残留源文件并生成映射
-    language_extensions = {
-        "c++": (['.cpp', '.cxx', '.cc', '.c', '.h', '.hpp', '.hxx'], ['.py']),
-        "python": (['.py'], ['.java', '.cpp']),
-        "java": (['.java'], ['.py', '.cpp']),
-        "javascript": (['.js', '.jsx'], ['.py']),
+    # ── 扩展名映射 ──
+    ext_map = {
+        "c": [".c", ".h"],
+        "c++": [".cpp", ".cxx", ".cc", ".c", ".h", ".hpp", ".hxx"],
+        "c#": [".cs"],
+        "java": [".java"],
+        "javascript": [".js", ".jsx", ".mjs"],
+        "matlab": [".m"],
+        "python": [".py"],
+        "rust": [".rs"],
+        "go": [".go"],
+    }
+    tgt_map = {
+        "c": [".c", ".h"],
+        "c++": [".cpp", ".hpp"],
+        "c#": [".cs"],
+        "java": [".java"],
+        "javascript": [".js"],
+        "python": [".py"],
+        "rust": [".rs"],
+        "go": [".go"],
     }
     src_key = source_language.lower()
-    lang_entry = language_extensions.get(src_key)
-    if lang_entry:
-        source_extensions, target_extensions = lang_entry
-    else:
-        source_extensions = ['.c', '.cpp', '.h', '.py', '.java', '.js']
-        target_extensions = ['.py'] if target_language.lower() == 'python' else ['.java']
+    tgt_key = target_language.lower()
+    source_exts = ext_map.get(src_key, [".py"])
+    target_exts = tgt_map.get(tgt_key, [".java"])
 
-    # 清理源文件（兜底）
-    mappings = cleanup_source_files(target_dir, source_extensions, target_extensions)
+    # ── 准备目标目录 ──
+    target_dir = Path(target_path)
+    if target_dir.exists():
+        shutil.rmtree(target_dir)
+    target_dir.mkdir(parents=True)
 
-    # 生成 MAPPING.txt
+    # ── 复制源文件 ──
+    source_dir = Path(source_path)
+    if not source_dir.exists():
+        raise FileNotFoundError(f"源目录不存在: {source_dir}")
+    copied = 0
+    for f in source_dir.rglob("*"):
+        if f.is_dir():
+            continue
+        if any(str(f).lower().endswith(e) for e in source_exts):
+            tgt = target_dir / f.relative_to(source_dir)
+            tgt.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(f, tgt)
+            copied += 1
+        elif f.name.lower() in (
+            "requirements.txt", "setup.py", "setup.cfg", "pyproject.toml",
+            "makefile", "cmakelists.txt", "pom.xml", "build.gradle",
+            "cargo.toml", "package.json",
+        ):
+            tgt = target_dir / f.relative_to(source_dir)
+            tgt.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(f, tgt)
+    logger.info(f"复制了 {copied} 个源文件到 {target_dir}")
+
+    # ── 构建指令 ──
+    import platform
+    ls_cmd = "dir /b" if platform.system() == "Windows" else "ls"
+    max_files = max(1, max_iterations // 3)
+
+    instruction = (
+        f"Translate project '{project_name}' from {source_language} to {target_language}.\n\n"
+        f"Target directory: {target_dir} (you are in this directory)\n"
+        f"{copied} {source_language} files were copied here.\n\n"
+        f"WORKFLOW:\n"
+        f"1. List files: ExecuteCommand(command=\"{ls_cmd}\")\n"
+        "2. For each .py file, do: ReadFile → CreateFile → DeleteFile\n"
+        "3. Use relative paths like 'chat_router.py' or 'subdir/module.py'\n\n"
+        "CreateFile FORMAT:\n"
+        'CreateFile(path="ChatRouter.java"):\n'
+        "```java\n"
+        "public class ChatRouter {\n"
+        '    public static void main(String[] args) {}\n'
+        "}\n"
+        "```\n\n"
+        f"You have {max_iterations} steps. You can translate ~{max_files} files.\n"
+        "When done, output: Action: Finished()"
+    )
+
+    # ── 运行 ReAct 循环 ──
+    run_react_loop(instruction, str(target_dir), max_iterations)
+
+    # ── 后处理 ──
+    mappings = cleanup_source_files(target_dir, source_exts, target_exts)
+    missing = check_missing_files(target_dir, target_dir, source_exts, target_exts)
+
+    # ── 生成报告 ──
     mapping_file = target_dir / "MAPPING.txt"
-    with open(mapping_file, 'w', encoding='utf-8') as f:
-        f.write(f"# Translation mapping for project: {project_name}\n")
-        f.write(f"# Source language: {source_language} → Target language: {target_language}\n")
+    with open(mapping_file, "w", encoding="utf-8") as f:
+        f.write(f"# Translation: {project_name}  {source_language} → {target_language}\n")
         f.write("# Format: source_file -> target_file\n\n")
         if mappings:
-            for src, tgt in mappings:
-                f.write(f"{src} -> {tgt}\n")
+            for src, tgt_m in mappings:
+                f.write(f"{src} -> {tgt_m}\n")
         else:
-            f.write("# No source files were deleted (possible incomplete translation).\n")
-            for t_ext in target_extensions:
-                for target_file in target_dir.rglob(f"*{t_ext}"):
-                    f.write(f"# (inferred) {target_file.stem}.* -> {target_file.relative_to(target_dir)}\n")
-        f.write("\nNote: Original source files have been deleted where corresponding target files exist.\n")
-    logger.info(f"已生成映射文件: {mapping_file}")
+            f.write("# No files were translated.\n")
+    logger.info(f"MAPPING.txt -> {mapping_file}")
 
-    # 检查缺失文件
-    missing = check_missing_files(source_dir, target_dir, source_extensions, target_extensions)
     if missing:
-        logger.warning(f"发现 {len(missing)} 个未翻译的源文件:")
+        logger.warning(f"未翻译: {len(missing)} 个文件 (显示前10个):")
         for m in missing[:10]:
             logger.warning(f"  - {m}")
         missing_file = target_dir / "MISSING_FILES.txt"
-        with open(missing_file, 'w', encoding='utf-8') as f:
-            f.write(f"# 以下 {len(missing)} 个源文件未翻译\n")
+        with open(missing_file, "w", encoding="utf-8") as f:
             for m in missing:
                 f.write(f"{m}\n")
-        logger.info(f"未翻译文件列表已保存到 {missing_file}")
+        logger.info(f"MISSING_FILES.txt -> {missing_file}")
     else:
-        logger.info("所有源文件均已翻译。")
+        logger.info("所有源文件均已翻译！")
 
-    logger.info(f"翻译任务完成: {project_name} -> {target_dir}")
+    logger.info(f"翻译完成: {project_name} -> {target_dir}")
