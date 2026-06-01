@@ -1,6 +1,6 @@
 # 大语言模型配置文件
 llm:
   provider: "openai"
-  model: "deepseek-chat"
-  api_key: ""   # 替换为您的真实 API Key
+  model: "deepseek-v4-flash"
+  api_key: "sk-b57e98ada2a545f5be76d2165f1dd72b"   # 替换为您的真实 API Key
   base_url: "https://api.deepseek.com/v1"

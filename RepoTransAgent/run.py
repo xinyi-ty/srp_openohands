@@ -19,7 +19,7 @@ if __name__ == "__main__":
     parser.add_argument("--target_language", required=True, help="目标语言，如 Java")
     parser.add_argument(
         "--model_name",
-        default="deepseek-chat",
+        default="deepseek-v4-flash",
         help="LLM 模型名称",
     )
     parser.add_argument(
